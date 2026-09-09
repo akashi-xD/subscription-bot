@@ -2,14 +2,17 @@ import os
 import json
 import logging
 from datetime import datetime, date
+from dateutil.relativedelta import relativedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "0"))
-REMINDER_DAYS = int(os.environ.get("REMINDER_DAYS", "7"))
-DATA_FILE = "subscriptions.json"
+DATA_FILE  = "subscriptions.json"
+
+# Дни, в которые отправляем напоминание
+REMINDER_DAYS = {7, 3, 1}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -19,99 +22,135 @@ logging.basicConfig(
 # === РАБОТА С ДАННЫМИ ===
 
 def load_subs() -> dict:
-    """Загружает подписки из файла."""
     if not os.path.exists(DATA_FILE):
         return {}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_subs(data: dict):
-    """Сохраняет подписки в файл."""
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def days_until(date_str: str) -> int:
-    """Сколько дней до даты оплаты."""
-    pay_date = datetime.strptime(date_str, "%d.%m.%Y").date()
-    return (pay_date - date.today()).days
+def next_payment_date(day: int) -> date:
+    """
+    Возвращает ближайшую будущую дату оплаты по дню месяца.
+    Например, day=15 → следующее 15-е число (этого или следующего месяца).
+    Если сегодня уже 15-е или позже — берём следующий месяц.
+    """
+    today = date.today()
+    # Пробуем этот месяц
+    try:
+        candidate = today.replace(day=day)
+    except ValueError:
+        # Такого дня нет в этом месяце (напр. 31 февраля) — берём следующий
+        candidate = (today.replace(day=1) + relativedelta(months=1)).replace(day=day)
+
+    if candidate <= today:
+        # Дата уже прошла или сегодня — следующий месяц
+        candidate = candidate + relativedelta(months=1)
+        # На случай коротких месяцев
+        try:
+            candidate = candidate.replace(day=day)
+        except ValueError:
+            import calendar
+            last_day = calendar.monthrange(candidate.year, candidate.month)[1]
+            candidate = candidate.replace(day=last_day)
+
+    return candidate
+
+def days_until_next(day: int) -> int:
+    return (next_payment_date(day) - date.today()).days
 
 # === КОМАНДЫ БОТА ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветствие и список команд."""
     text = (
-        "👋 Привет! Я бот для напоминаний об оплате подписок.\n\n"
+        "👋 Привет! Я слежу за вашими подписками и напоминаю об оплате.\n\n"
         "📋 *Команды:*\n"
-        "/add Название ДД.ММ.ГГГГ Цена — добавить подписку\n"
-        "/list — показать все подписки\n"
+        "/add Название ЧислоМесяца Цена — добавить подписку\n"
+        "/list — список всех подписок\n"
         "/delete Название — удалить подписку\n"
-        "/check — проверить ближайшие платежи прямо сейчас\n\n"
-        "📌 *Пример:*\n"
-        "`/add Netflix 15.02.2026 799`"
+        "/check — проверить прямо сейчас\n\n"
+        "📌 *Примеры:*\n"
+        "`/add Netflix 15 799` — списание каждое 15-е\n"
+        "`/add Spotify 1 299` — списание каждое 1-е\n\n"
+        "🔔 Напоминания приходят за *7, 3 и 1 день* до оплаты."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /add Netflix 15.02.2026 799
-    Добавляет или обновляет подписку.
+    /add Netflix 15 799
+    Число месяца — от 1 до 28 (28 чтобы работало в феврале).
     """
     if len(context.args) < 2:
         await update.message.reply_text(
-            "❌ Укажите: /add Название ДД.ММ.ГГГГ Цена\n"
-            "Пример: `/add Netflix 15.02.2026 799`",
+            "❌ Укажите: /add Название ЧислоМесяца Цена\n"
+            "Пример: `/add Netflix 15 799`",
             parse_mode="Markdown"
         )
         return
 
-    name = context.args[0]
-    date_str = context.args[1]
-    price = context.args[2] if len(context.args) >= 3 else ""
+    name     = context.args[0]
+    day_str  = context.args[1]
+    price    = context.args[2] if len(context.args) >= 3 else ""
 
-    # Проверяем формат даты
     try:
-        datetime.strptime(date_str, "%d.%m.%Y")
+        day = int(day_str)
+        if not (1 <= day <= 31):
+            raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ\n"
-            "Пример: `15.02.2026`",
+            "❌ Число месяца должно быть от 1 до 31.\n"
+            "Пример: `/add Netflix 15 799`",
             parse_mode="Markdown"
         )
         return
 
+    if day > 28:
+        warning = (
+            f"\n⚠️ День {day} есть не во всех месяцах. "
+            "В коротких месяцах буду брать последний день."
+        )
+    else:
+        warning = ""
+
     subs = load_subs()
-    subs[name] = {"date": date_str, "price": price}
+    subs[name] = {"day": day, "price": price}
     save_subs(subs)
 
+    next_date = next_payment_date(day)
+    d = days_until_next(day)
     price_text = f", {price} ₸/₽" if price else ""
+
     await update.message.reply_text(
         f"✅ Добавлено: *{name}*\n"
-        f"📅 Дата оплаты: {date_str}{price_text}",
+        f"📅 Списание: каждое *{day}-е* число{price_text}\n"
+        f"⏳ Следующий платёж: {next_date.strftime('%d.%m.%Y')} (через {d} дн.)"
+        f"{warning}",
         parse_mode="Markdown"
     )
 
 async def list_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /list — показывает все подписки, отсортированные по дате.
-    """
     subs = load_subs()
 
     if not subs:
         await update.message.reply_text("📭 Подписок пока нет. Добавьте через /add")
         return
 
-    # Сортируем по дате
-    sorted_subs = sorted(subs.items(), key=lambda x: datetime.strptime(x[1]["date"], "%d.%m.%Y"))
+    # Сортируем по количеству дней до следующего платежа
+    sorted_subs = sorted(subs.items(), key=lambda x: days_until_next(x[1]["day"]))
 
     lines = ["📋 *Ваши подписки:*\n"]
     for name, info in sorted_subs:
-        d = days_until(info["date"])
+        d          = days_until_next(info["day"])
+        next_date  = next_payment_date(info["day"])
         price_text = f" — {info['price']} ₸/₽" if info.get("price") else ""
 
-        if d < 0:
-            status = f"⛔ просрочено ({abs(d)} дн. назад)"
-        elif d == 0:
+        if d == 0:
             status = "🔴 сегодня!"
+        elif d == 1:
+            status = "🟠 завтра!"
         elif d <= 3:
             status = f"🟠 через {d} дн."
         elif d <= 7:
@@ -119,16 +158,16 @@ async def list_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             status = f"🟢 через {d} дн."
 
-        lines.append(f"• *{name}*{price_text}\n  {info['date']} — {status}")
+        lines.append(
+            f"• *{name}*{price_text}\n"
+            f"  каждое {info['day']}-е | след. {next_date.strftime('%d.%m.%Y')} — {status}"
+        )
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def delete_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /delete Netflix — удаляет подписку.
-    """
     if not context.args:
-        await update.message.reply_text("❌ Укажите название: /delete Netflix")
+        await update.message.reply_text("❌ Укажите название: `/delete Netflix`", parse_mode="Markdown")
         return
 
     name = context.args[0]
@@ -143,77 +182,92 @@ async def delete_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"🗑 Подписка *{name}* удалена.", parse_mode="Markdown")
 
 async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /check — немедленная проверка ближайших платежей.
-    """
-    await send_reminders(context, chat_id=update.message.chat_id)
+    """/check — показывает подписки, по которым сегодня нужно напомнить."""
+    found = await send_reminders(context, chat_id=update.message.chat_id, force=True)
+    if not found:
+        await update.message.reply_text(
+            "✅ Сегодня напоминаний нет.\n"
+            "Напоминания приходят за 7, 3 и 1 день до оплаты."
+        )
 
-# === АВТОМАТИЧЕСКОЕ НАПОМИНАНИЕ ===
+# === АВТОМАТИЧЕСКИЕ НАПОМИНАНИЯ ===
 
-async def send_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int = None):
-    """Отправляет напоминания о ближайших платежах."""
+async def send_reminders(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int = None,
+    force: bool = False
+) -> bool:
+    """
+    Проверяет подписки и отправляет напоминание, если до оплаты
+    осталось ровно 7, 3 или 1 день.
+
+    force=True — показать все совпадения (для /check).
+    Возвращает True если что-то отправлено.
+    """
     target = chat_id or MY_CHAT_ID
     if not target:
-        return
+        return False
 
     subs = load_subs()
     if not subs:
-        if chat_id:  # только если вызвано вручную
-            await context.bot.send_message(target, "📭 Подписок нет.")
-        return
+        return False
 
-    urgent = []
+    hits = []
     for name, info in subs.items():
-        d = days_until(info["date"])
-        if d < 0:
-            urgent.append((name, info, d, "⛔"))
-        elif d == 0:
-            urgent.append((name, info, d, "🔴"))
-        elif d <= REMINDER_DAYS:
-            urgent.append((name, info, d, "🟡" if d > 3 else "🟠"))
+        d = days_until_next(info["day"])
+        # Отправляем только в нужные дни (или всё при force)
+        if d in REMINDER_DAYS or force:
+            hits.append((name, info, d))
 
-    if not urgent:
-        if chat_id:  # только если вызвано вручную
-            await context.bot.send_message(
-                target,
-                f"✅ Ближайших платежей (в течение {REMINDER_DAYS} дней) нет."
-            )
-        return
+    if not hits:
+        return False
 
-    lines = ["💳 *Ближайшие платежи:*\n"]
-    for name, info, d, icon in sorted(urgent, key=lambda x: x[2]):
+    # Сортируем: ближайшие первыми
+    hits.sort(key=lambda x: x[2])
+
+    lines = ["💳 *Напоминание об оплате:*\n"]
+    for name, info, d in hits:
+        next_date  = next_payment_date(info["day"])
         price_text = f" — {info['price']} ₸/₽" if info.get("price") else ""
-        if d < 0:
-            timing = f"просрочено {abs(d)} дн. назад"
-        elif d == 0:
-            timing = "сегодня!"
+
+        if d == 0:
+            urgency = "🔴 *сегодня!*"
+        elif d == 1:
+            urgency = "🟠 *завтра!*"
+        elif d <= 3:
+            urgency = f"🟠 через *{d} дня*"
         else:
-            timing = f"через {d} дн."
-        lines.append(f"{icon} *{name}*{price_text}\n  {info['date']} ({timing})")
+            urgency = f"🟡 через *{d} дней*"
+
+        lines.append(
+            f"• *{name}*{price_text}\n"
+            f"  {next_date.strftime('%d.%m.%Y')} — {urgency}"
+        )
 
     await context.bot.send_message(target, "\n".join(lines), parse_mode="Markdown")
+    return True
 
 # === ЗАПУСК ===
 
 def main():
     if not BOT_TOKEN:
-        raise ValueError("Не задан BOT_TOKEN в переменных окружения!")
+        raise ValueError("Не задан BOT_TOKEN!")
     if not MY_CHAT_ID:
-        raise ValueError("Не задан MY_CHAT_ID в переменных окружения!")
+        raise ValueError("Не задан MY_CHAT_ID!")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_subscription))
-    app.add_handler(CommandHandler("list", list_subscriptions))
+    app.add_handler(CommandHandler("start",  start))
+    app.add_handler(CommandHandler("add",    add_subscription))
+    app.add_handler(CommandHandler("list",   list_subscriptions))
     app.add_handler(CommandHandler("delete", delete_subscription))
-    app.add_handler(CommandHandler("check", check_now))
+    app.add_handler(CommandHandler("check",  check_now))
 
-    # Ежедневное напоминание в 9:00 (UTC+5 для Алматы = 4:00 UTC)
+    # Запускаем проверку каждый день в 09:00 по Алматы (UTC+5 = 04:00 UTC)
+    from datetime import time as dtime
     app.job_queue.run_daily(
         send_reminders,
-        time=datetime.strptime("04:00", "%H:%M").time()  # 09:00 Алматы
+        time=dtime(hour=4, minute=0)  # 04:00 UTC = 09:00 Алматы
     )
 
     print("✅ Бот запущен!")
